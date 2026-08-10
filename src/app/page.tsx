@@ -20,7 +20,7 @@ export default function Home() {
           </Link>
 
           <Link
-            href="/signup"
+            href="/register"
             className="px-5 py-2.5 rounded-lg bg-blue-500 hover:bg-blue-600 transition"
           >
             Get Started
@@ -120,7 +120,7 @@ export default function Home() {
           </p>
 
           <Link
-            href="/signup"
+            href="/register"
             className="inline-block mt-7 px-7 py-3.5 rounded-xl bg-blue-500 hover:bg-blue-600 font-semibold transition"
           >
             Get Started
