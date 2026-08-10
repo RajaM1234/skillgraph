@@ -592,7 +592,7 @@ The video demonstrates:
 9. Graph database model
 10. Graph-based recommendation concept
 
-**Video:** `(https://www.loom.com/share/0a6b2f1e08cd4557abea0c2bb5deb65b)`
+**Video:** `https://www.loom.com/share/0a6b2f1e08cd4557abea0c2bb5deb65b`
 
 ---
 
