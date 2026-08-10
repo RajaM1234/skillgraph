@@ -46,7 +46,7 @@ export default function Home() {
 
         <div className="flex justify-center gap-4 mt-10">
           <Link
-            href="/signup"
+            href="/register"
             className="px-7 py-3.5 rounded-xl bg-blue-500 hover:bg-blue-600 font-semibold transition"
           >
             Get Started →

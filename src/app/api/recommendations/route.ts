@@ -1,5 +1,8 @@
 import { NextRequest, NextResponse } from "next/server";
+import { cookies } from "next/headers";
+import { randomUUID } from "crypto";
 import driver from "@/lib/cognodb";
+import { verifyToken } from "@/lib/auth";
 
 type SkillMatch = {
   name: string;
@@ -7,10 +10,59 @@ type SkillMatch = {
   matchType: "direct" | "related";
 };
 
+function toNumber(value: unknown): number {
+  if (typeof value === "number") {
+    return value;
+  }
+
+  if (
+    value &&
+    typeof value === "object" &&
+    "toNumber" in value &&
+    typeof (value as { toNumber: unknown }).toNumber === "function"
+  ) {
+    return (value as { toNumber: () => number }).toNumber();
+  }
+
+  return Number(value);
+}
+
 export async function POST(request: NextRequest) {
   const session = driver.session();
 
   try {
+    // -----------------------------------------
+    // 1. CHECK LOGIN
+    // -----------------------------------------
+
+    const cookieStore = await cookies();
+
+    const token = cookieStore.get("skillgraph_token")?.value;
+
+    if (!token) {
+      return NextResponse.json(
+        {
+          error: "Please login first",
+        },
+        { status: 401 },
+      );
+    }
+
+    const user = verifyToken(token);
+
+    if (!user) {
+      return NextResponse.json(
+        {
+          error: "Invalid or expired session",
+        },
+        { status: 401 },
+      );
+    }
+
+    // -----------------------------------------
+    // 2. READ SELECTED SKILLS
+    // -----------------------------------------
+
     const body = await request.json();
 
     const skills = Array.isArray(body.skills)
@@ -24,23 +76,13 @@ export async function POST(request: NextRequest) {
         {
           error: "Please select at least one skill",
         },
-        { status: 400 }
+        { status: 400 },
       );
     }
 
-    /*
-     * Find every career and compare its required skills
-     * against the user's selected skills.
-     *
-     * Direct skill match:
-     *   weight = 1.0
-     *
-     * Related skill match:
-     *   weight = 0.5
-     *
-     * This means having the exact skill is more valuable
-     * than simply having a related skill.
-     */
+    // -----------------------------------------
+    // 3. FIND CAREER RECOMMENDATIONS
+    // -----------------------------------------
 
     const result = await session.run(
       `
@@ -62,7 +104,6 @@ export async function POST(request: NextRequest) {
         job,
         requiredSkills,
         requiredSkill,
-        $skills AS selectedSkills,
         max(
           CASE
             WHEN requiredSkill.name IN $skills
@@ -78,7 +119,6 @@ export async function POST(request: NextRequest) {
       WITH
         job,
         requiredSkills,
-        selectedSkills,
 
         collect({
           name: requiredSkill.name,
@@ -92,7 +132,6 @@ export async function POST(request: NextRequest) {
       WITH
         job,
         requiredSkills,
-        selectedSkills,
         skillMatches,
         totalScore,
         requiredCount,
@@ -118,29 +157,26 @@ export async function POST(request: NextRequest) {
       `,
       {
         skills,
-      }
+      },
     );
 
-    const recommendations = result.records.map((record) => {
-      const requiredSkills =
-        record.get("requiredSkills") || [];
+    // -----------------------------------------
+    // 4. FORMAT RECOMMENDATIONS
+    // -----------------------------------------
 
-      const skillMatches =
-        record.get("skillMatches") || [];
+    const recommendations = result.records.map((record) => {
+      const requiredSkills = record.get("requiredSkills") || [];
+
+      const skillMatches = record.get("skillMatches") || [];
 
       const matchedSkills: SkillMatch[] = [];
-
       const relatedSkills: SkillMatch[] = [];
-
       const missingSkills: string[] = [];
 
       for (const match of skillMatches) {
         const name = match.name;
 
-        const score =
-          typeof match.score === "number"
-            ? match.score
-            : match.score.toNumber();
+        const score = toNumber(match.score);
 
         if (score >= 1) {
           matchedSkills.push({
@@ -159,72 +195,102 @@ export async function POST(request: NextRequest) {
         }
       }
 
-      const matchedCountValue =
-        matchedSkills.length;
-
-      const requiredCountValue =
-        typeof record.get("requiredCount") === "number"
-          ? record.get("requiredCount")
-          : record.get("requiredCount").toNumber();
-
-      const matchPercentageValue =
-        typeof record.get("matchPercentage") === "number"
-          ? record.get("matchPercentage")
-          : record.get("matchPercentage").toNumber();
-
       return {
         role: record.get("role"),
 
-        matchedSkills: matchedSkills.map(
-          (skill) => skill.name
-        ),
+        matchedSkills: matchedSkills.map((skill) => skill.name),
 
-        relatedSkills: relatedSkills.map(
-          (skill) => skill.name
-        ),
+        relatedSkills: relatedSkills.map((skill) => skill.name),
 
         missingSkills,
 
         requiredSkills,
 
-        matchedCount: matchedCountValue,
+        matchedCount: matchedSkills.length,
 
         relatedCount: relatedSkills.length,
 
-        requiredCount: requiredCountValue,
+        requiredCount: toNumber(record.get("requiredCount")),
 
-        matchPercentage: matchPercentageValue,
+        matchPercentage: toNumber(record.get("matchPercentage")),
       };
     });
 
-    /*
-     * Remove careers with absolutely no connection
-     * to the user's selected skills.
-     */
-    const filteredRecommendations =
-      recommendations.filter(
-        (recommendation) =>
-          recommendation.matchedCount > 0 ||
-          recommendation.relatedCount > 0
-      );
+    // -----------------------------------------
+    // 5. REMOVE COMPLETELY UNRELATED CAREERS
+    // -----------------------------------------
+
+    const filteredRecommendations = recommendations.filter(
+      (recommendation) =>
+        recommendation.matchedCount > 0 || recommendation.relatedCount > 0,
+    );
+
+    // -----------------------------------------
+    // 6. SAVE SEARCH HISTORY
+    // -----------------------------------------
+
+    const searchId = randomUUID();
+
+    await session.run(
+      `
+      MATCH (u:User {email: $email})
+
+      CREATE (search:Search {
+        id: $searchId,
+        skills: $skills,
+        createdAt: $createdAt
+      })
+
+      CREATE (u)-[:MADE_SEARCH]->(search)
+
+      WITH search
+
+      UNWIND $recommendations AS recommendation
+
+      MATCH (job:JobRole {
+        name: recommendation.role
+      })
+
+      CREATE (search)-[
+        r:RECOMMENDED {
+          matchPercentage:
+            recommendation.matchPercentage
+        }
+      ]->(job)
+
+      RETURN search
+      `,
+      {
+        email: user.email,
+        searchId,
+        skills,
+        createdAt: new Date().toISOString(),
+
+        recommendations: filteredRecommendations.map((recommendation) => ({
+          role: recommendation.role,
+          matchPercentage: recommendation.matchPercentage,
+        })),
+      },
+    );
+
+    // -----------------------------------------
+    // 7. RETURN RESULTS TO DASHBOARD
+    // -----------------------------------------
 
     return NextResponse.json({
+      success: true,
       recommendations: filteredRecommendations,
     });
   } catch (error) {
-    console.error(
-      "Recommendation error:",
-      error
-    );
+    console.error("Recommendation error:", error);
 
     return NextResponse.json(
       {
-        error:
-          "Failed to generate recommendations",
+        error: "Failed to generate recommendations",
       },
       {
         status: 500,
-      }
+      },
     );
   } finally {
     await session.close();
